@@ -1,67 +1,208 @@
-# AltLiqIQ — Altcoin Perpetual Liquidation Intelligence
+# AltLiqIQ
 
-Real-time liquidation cluster maps, squeeze risk classification, and cascade size estimation for altcoin perp markets. BTC/ETH excluded. Built on free public APIs — no API keys required.
+Altcoin perpetual liquidation intelligence for Binance, Bybit, and OKX.
+
+AltLiqIQ is an MCP server that maps liquidation clusters, classifies squeeze risk, and estimates cascade size for altcoin perpetual markets. It excludes BTC and ETH by design and focuses on altcoins where liquidation positioning can change quickly and free raw exchange endpoints are harder to interpret.
+
+## What It Does
+
+- Aggregates perp market data across Binance, Bybit, and OKX
+- Detects liquidation clusters from merged order books and recent liquidation activity
+- Scores squeeze risk as `LOW`, `MODERATE`, `HIGH`, or `EXTREME`
+- Labels likely setup direction such as `LONG_SQUEEZE` or `SHORT_SQUEEZE`
+- Estimates liquidation cascade size at a target price
+- Compares up to 8 supported assets in one ranked call
 
 ## Supported Assets
-SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE, INJ, TIA, JTO, PYTH, STRK, MANTA, ALT, NEAR, FTM, MATIC, OP, ATOM
 
-## Tools
+`SOL`, `DOGE`, `LINK`, `AVAX`, `SUI`, `ARB`, `WIF`, `PEPE`, `INJ`, `TIA`, `JTO`, `PYTH`, `STRK`, `MANTA`, `ALT`, `NEAR`, `FTM`, `MATIC`, `OP`, `ATOM`
 
-### `get_altcoin_liq_clusters(asset, venues?)`
-Returns top liquidation clusters for an altcoin perp:
-- `top_clusters[]` — price_level, usd_volume, side, distance_pct
-- `dominant_side` — long | short
-- `risk_classification` — LOW | MODERATE | HIGH | EXTREME
-- `squeeze_type` — LONG_SQUEEZE | SHORT_SQUEEZE | etc
-- `funding_rate` — current funding rate %
-- `confidence_score` — 0–1
-
-### `compare_altcoin_liq_risk(assets[])`
-Side-by-side comparison of up to 8 altcoins ranked by risk severity.
-
-### `estimate_cascade(asset, target_price)`
-Estimates total USD liquidated if price reaches target:
-- `cascade_size_usd`
-- `severity` — LOW | MODERATE | HIGH | EXTREME
-- `clusters_in_path`
-- `direction` — up | down
+`BTC` and `ETH` are intentionally excluded.
 
 ## Data Sources
-- Binance Futures public API (no key needed)
-  - `/fapi/v1/premiumIndex` — mark price
-  - `/fapi/v1/openInterest` — OI
-  - `/fapi/v1/depth` — order book walls
-  - `/fapi/v1/allForceOrders` — liquidation history
-  - `/futures/data/topLongShortPositionRatio` — LSR
-  - `/fapi/v1/fundingRate` — funding
 
-## Deploy to Railway
+AltLiqIQ uses public exchange APIs only. No exchange API keys are required.
 
-1. Push this repo to GitHub
-2. Connect repo to Railway
-3. Set environment variable: `CTX_SECRET=<your_ctxprotocol_secret>`
-4. Railway auto-detects `Procfile` and deploys
+### Binance Futures
+
+- Mark price
+- Open interest
+- Order book depth
+- Forced liquidation history
+- Top trader long/short ratio
+- Funding rate
+
+### Bybit
+
+- Mark price
+- Open interest
+- Order book
+- Funding rate
+- Account long/short ratio
+- Recent trades used as a liquidation proxy for large prints
+
+### OKX
+
+- Mark price
+- Open interest
+- Order book
+- Public liquidation orders
+- Funding rate
+- Contract long/short account ratio
+
+## How It Works
+
+The server fetches venue data concurrently, then normalizes it into a single analysis layer:
+
+- Mark price is merged using the median of available venues
+- Open interest is summed across venues
+- Long/short positioning is averaged across available readings
+- Funding is averaged across venues
+- Order books are merged into one cluster-detection surface
+- Liquidations are pooled across venues, with OKX liquidation prints weighted more heavily because they come from a direct public liquidation endpoint
+
+The cluster engine combines:
+
+1. Order book wall density
+2. Recent liquidation distribution
+3. Synthetic OI-aware cluster estimates
+
+## MCP Tools
+
+### `get_altcoin_liq_clusters`
+
+Returns a real-time liquidation cluster map for one altcoin.
+
+Inputs:
+
+- `asset`: altcoin ticker such as `SOL` or `LINK`
+- `venues`: optional array of venues from `binance`, `bybit`, `okx`
+
+Key outputs:
+
+- `mark_price`
+- `open_interest_usd`
+- `funding_rate`
+- `long_short_ratio`
+- `top_clusters`
+- `dominant_side`
+- `risk_classification`
+- `squeeze_type`
+- `nearby_cluster_usd`
+- `funding_bias`
+- `confidence_score`
+- `venues_used`
+- `venue_breakdown`
+- `analysis_timestamp`
+
+Rate-limit metadata:
+
+- `60` requests per minute
+- `1000ms` cooldown
+- `8` max concurrency
+- Use `compare_altcoin_liq_risk` instead of repeating this tool across many assets
+
+### `compare_altcoin_liq_risk`
+
+Compares liquidation risk across multiple altcoin perp markets and ranks them by severity.
+
+Inputs:
+
+- `assets`: array of up to 8 altcoin tickers
+
+Key outputs:
+
+- `assets_compared`
+- `results`
+- `highest_risk_asset`
+- `analysis_timestamp`
+
+Rate-limit metadata:
+
+- `20` requests per minute
+- `3000ms` cooldown
+- `2` max concurrency
+- Heavy fan-out tool across 3 venues and up to 8 assets
+
+### `estimate_cascade`
+
+Estimates how much USD liquidation could be triggered if price reaches a target.
+
+Inputs:
+
+- `asset`: altcoin ticker
+- `target_price`: target price in USD
+
+Key outputs:
+
+- `mark_price`
+- `target_price`
+- `direction`
+- `pct_move_required`
+- `clusters_in_path`
+- `cascade_size_usd`
+- `severity`
+- `confidence_score`
+- `analysis_timestamp`
+
+Rate-limit metadata:
+
+- `60` requests per minute
+- `1000ms` cooldown
+- `8` max concurrency
+- Reuses cached cluster data for 30 seconds when possible
+
+## Endpoints
+
+- `GET /` service info, supported assets, pricing, and tool list
+- `GET /health` health check
+- `GET /sse` MCP SSE transport
+- `POST /messages` MCP JSON-RPC message endpoint
+
 
 ## Local Development
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env with your CTX_SECRET
+# edit .env and set CTX_SECRET
 python main.py
 ```
 
-Server runs on `http://localhost:8000`
+The server runs on `http://localhost:8000`.
 
-## MCP Endpoints
-- `GET /` — service info
-- `GET /health` — health check
-- `GET /sse` — SSE connection
-- `POST /messages` — MCP JSON-RPC (auth enforced on tools/call)
+## Deploying
 
-## Must-Win Prompts
-1. "Where are the biggest liquidation clusters on SOL perps right now?"
-2. "Is DOGE at risk of a long squeeze today based on current liquidation positioning?"
-3. "Compare liquidation risk on SOL vs AVAX perps right now"
-4. "What altcoins have the most dangerous liquidation clusters right now?"
-5. "How large would the cascade be on LINK perps if price drops 5% from here?"
+
+`Procfile`:
+
+```txt
+web: uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+## Example Queries
+
+- "Where are the biggest liquidation clusters on SOL perps right now?"
+- "Is DOGE at risk of a long squeeze based on current liquidation positioning?"
+- "Compare liquidation risk on SOL, AVAX, LINK, and ARB right now"
+- "Estimate the cascade on LINK if price drops 5% from here"
+- "Show PEPE liquidation clusters using only Bybit and OKX"
+- "Which supported altcoin has the highest squeeze risk right now?"
+
+## Operational Notes
+
+- Cache TTL is `30` seconds
+- The server is query-only and does not place trades
+- Multi-asset comparison should go through `compare_altcoin_liq_risk` instead of repeated single-asset calls
+- Bybit liquidation detection is proxy-based from recent large trades, so confidence can differ from venues with direct liquidation feeds
+
+## Why This Is Useful
+
+Free exchange endpoints provide raw pieces of the picture, but not the normalized answer traders usually want:
+
+- Where are the biggest liquidation pockets?
+- Which side is most vulnerable?
+- Is this setup likely to squeeze up or down?
+- How large could a cascade be if price moves into those clusters?
+
+AltLiqIQ turns fragmented multi-venue perp data into one consistent response surface that an agent or trader can act on quickly.

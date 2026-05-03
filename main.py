@@ -1066,6 +1066,20 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["asset"],
+                "_meta": {
+                    "rateLimit": {
+                        "maxRequestsPerMinute": 60,
+                        "cooldownMs": 1000,
+                        "maxConcurrency": 8,
+                        "supportsBulk": False,
+                        "recommendedBatchTools": ["compare_altcoin_liq_risk"],
+                        "notes": (
+                            "Each call fans out to 3 exchanges concurrently (Binance, Bybit, OKX). "
+                            "For multi-asset queries use compare_altcoin_liq_risk — "
+                            "batches up to 8 assets in a single call."
+                        ),
+                    }
+                },
             },
             outputSchema={
                 "type": "object",
@@ -1107,6 +1121,19 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["assets"],
+                "_meta": {
+                    "rateLimit": {
+                        "maxRequestsPerMinute": 20,
+                        "cooldownMs": 3000,
+                        "maxConcurrency": 2,
+                        "supportsBulk": True,
+                        "maxBulkAssets": 8,
+                        "notes": (
+                            "Heavy fan-out: fetches 3 exchanges x up to 8 assets concurrently. "
+                            "Limit to 2 concurrent calls. Prefer over 8x get_altcoin_liq_clusters."
+                        ),
+                    }
+                },
             },
             outputSchema={
                 "type": "object",
@@ -1139,6 +1166,19 @@ async def handle_list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["asset", "target_price"],
+                "_meta": {
+                    "rateLimit": {
+                        "maxRequestsPerMinute": 60,
+                        "cooldownMs": 1000,
+                        "maxConcurrency": 8,
+                        "supportsBulk": False,
+                        "notes": (
+                            "Internally calls get_altcoin_liq_clusters first then runs cascade math. "
+                            "Counts as one billable call. Cache TTL 30s — repeated calls for the same "
+                            "asset within 30s return cached cluster data."
+                        ),
+                    }
+                },
             },
             outputSchema={
                 "type": "object",
@@ -1247,6 +1287,21 @@ async def handle_root(request: Request):
         "supported_assets": SUPPORTED_ASSETS,
         "pricing": "$0.10 per response",
         "author": "AltLiqIQ",
+        "_meta": {
+            "rateLimit": {
+                "maxRequestsPerMinute": 60,
+                "cooldownMs": 1000,
+                "maxConcurrency": 8,
+                "supportsBulk": True,
+                "recommendedBatchTools": ["compare_altcoin_liq_risk"],
+                "notes": (
+                    "compare_altcoin_liq_risk batches up to 8 assets in one call — "
+                    "prefer over repeated get_altcoin_liq_clusters calls. "
+                    "estimate_cascade reuses cached cluster data (30s TTL) when called "
+                    "immediately after get_altcoin_liq_clusters for the same asset."
+                ),
+            }
+        },
     })
 
 
