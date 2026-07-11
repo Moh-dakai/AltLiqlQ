@@ -1417,12 +1417,62 @@ async def handle_messages(request: Request):
     return AlreadySentResponse()
 
 
+async def handle_debug_binance_liq(request: Request) -> JSONResponse:
+    """
+    TEMPORARY debug endpoint — runs raw, unwrapped calls to Binance's
+    allForceOrders endpoint (SOL + BTC control) plus a klines control check,
+    directly from THIS server's network path. This exists because local
+    machines often can't reach Binance at all (regional blocks, ISP
+    filtering), which makes local testing useless for diagnosing what the
+    deployed server itself sees.
+
+    Remove this route once the Binance liquidation gap is resolved — it's
+    diagnostic only, not part of the product surface.
+    """
+    async def raw_get(url: str, params: dict) -> Dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, params=params)
+                body_preview = r.text[:500]
+                parsed_len = None
+                try:
+                    parsed = r.json()
+                    if isinstance(parsed, list):
+                        parsed_len = len(parsed)
+                except Exception:
+                    pass
+                return {
+                    "status_code": r.status_code,
+                    "body_preview": body_preview,
+                    "parsed_list_length": parsed_len,
+                }
+        except Exception as e:
+            return {"exception": f"{type(e).__name__}: {e}"}
+
+    results = {
+        "sol_force_orders": await raw_get(
+            f"{BINANCE_FUTURES_BASE}/fapi/v1/allForceOrders",
+            {"symbol": "SOLUSDT", "limit": 100},
+        ),
+        "btc_force_orders_control": await raw_get(
+            f"{BINANCE_FUTURES_BASE}/fapi/v1/allForceOrders",
+            {"symbol": "BTCUSDT", "limit": 100},
+        ),
+        "klines_connectivity_control": await raw_get(
+            f"{BINANCE_FUTURES_BASE}/fapi/v1/klines",
+            {"symbol": "SOLUSDT", "interval": "1h", "limit": 2},
+        ),
+    }
+    return JSONResponse(results)
+
+
 app = Starlette(
     routes=[
         Route("/", handle_root),
         Route("/health", handle_health),
         Route("/sse", handle_sse),
         Route("/messages", handle_messages, methods=["POST"]),
+        Route("/debug/binance-liq", handle_debug_binance_liq),
     ],
     lifespan=lifespan,
 )
