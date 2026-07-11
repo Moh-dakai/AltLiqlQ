@@ -28,7 +28,7 @@ AltLiqIQ uses public exchange APIs only. No exchange API keys are required.
 - Mark price
 - Open interest
 - Order book depth
-- Forced liquidation history
+- ~~Forced liquidation history~~ *(Binance discontinued public access to `allForceOrders` — this data source is currently unavailable and is not part of the live liquidation signal. Binance still contributes mark price, OI, order book, funding, and long/short ratio.)*
 - Top trader long/short ratio
 - Funding rate
 
