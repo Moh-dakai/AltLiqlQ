@@ -400,10 +400,16 @@ async def okx_fetch_liquidations(asset: str) -> List[Dict]:
     if cached is not None:
         return cached
     try:
-        # OKX public liquidation endpoint
+        # OKX public liquidation endpoint.
+        # NOTE: instId is documented as "only applicable to MARGIN" for this
+        # endpoint. For SWAP/FUTURES/OPTION, OKX filters on instFamily (or uly)
+        # instead — passing instId here was silently matching nothing for
+        # SWAP requests, which is why every altcoin returned liq_count=0
+        # regardless of real market activity.
+        inst_family = inst_id.rsplit("-", 1)[0] if inst_id.endswith("-SWAP") else inst_id
         data = await okx_get("/api/v5/public/liquidation-orders", {
             "instType": "SWAP",
-            "instId": inst_id,
+            "instFamily": inst_family,
             "state": "filled",
             "limit": "100",
         })
@@ -694,18 +700,25 @@ def compute_liquidation_clusters(
             price_volumes[bucket]["usd_volume"] += usd_estimate
             price_volumes[bucket]["sources"].add("oi_estimate")
 
-    # Build cluster list
+    # Build cluster list. Each cluster is tagged is_synthetic=True only when
+    # its ENTIRE usd_volume comes from the Layer 3 OI/leverage-tier model
+    # with no order book or real liquidation confirmation. This is a hard
+    # boolean an agent can branch on directly, not something it has to infer
+    # by parsing the sources array itself.
     clusters = []
     for price, data in price_volumes.items():
         if data["usd_volume"] < 100_000:
             continue
         pct_from_mark = (price - mark_price) / mark_price * 100
+        sources = list(data["sources"])
+        is_synthetic = sources == ["oi_estimate"]
         clusters.append({
             "price_level": round(price, 6),
             "usd_volume": round(data["usd_volume"]),
             "side": data["side"],
             "distance_pct": round(pct_from_mark, 2),
-            "sources": list(data["sources"]),
+            "sources": sources,
+            "is_synthetic": is_synthetic,
         })
 
     clusters.sort(key=lambda x: x["usd_volume"], reverse=True)
@@ -917,21 +930,36 @@ class AltLiqIQServer:
         clusters = compute_liquidation_clusters(
             mark_price, orderbook, liquidations, oi_usd, long_short
         )
-        risk = classify_risk(clusters, mark_price, long_short, funding_rate)
+
+        # Observed clusters: backed by real order book depth and/or a real
+        # venue liquidation print. This is now what drives top_clusters and
+        # risk classification — the synthetic OI/leverage-tier layer no
+        # longer competes for the same ranking, so it can't crowd out real
+        # signal just because the modeled USD size is larger.
+        observed = [c for c in clusters if not c["is_synthetic"]]
+        estimated = [c for c in clusters if c["is_synthetic"]]
+
+        risk = classify_risk(observed, mark_price, long_short, funding_rate)
         confidence = compute_confidence_score(
-            len(clusters), len(liquidations) > 0, oi_usd, len(liquidations)
+            len(observed), len(liquidations) > 0, oi_usd, len(liquidations)
         )
 
-        top_clusters = [
-            {
+        def _public_fields(c):
+            return {
                 "price_level": c["price_level"],
                 "usd_volume": c["usd_volume"],
                 "side": c["side"],
                 "distance_pct": c["distance_pct"],
                 "sources": c["sources"],
+                "is_synthetic": c["is_synthetic"],
             }
-            for c in clusters[:8]
-        ]
+
+        top_clusters = [_public_fields(c) for c in observed[:8]]
+        estimated_clusters = [_public_fields(c) for c in estimated[:5]]
+
+        nearby_estimated_usd = sum(
+            c["usd_volume"] for c in estimated if abs(c["distance_pct"]) <= 5.0
+        )
 
         return {
             "success": True,
@@ -940,11 +968,19 @@ class AltLiqIQServer:
             "open_interest_usd": round(oi_usd),
             "funding_rate": round(funding_rate * 100, 4),
             "long_short_ratio": long_short,
+            # top_clusters: real, observed clusters only (order book depth
+            # and/or a real venue liquidation print). This is the primary
+            # signal and drives risk_classification / squeeze_type below.
             "top_clusters": top_clusters,
+            # estimated_clusters: the 5x/10x/20x OI/leverage-tier projection.
+            # A useful secondary view, but never blended into top_clusters
+            # ranking or risk scoring — see is_synthetic on each cluster.
+            "estimated_clusters": estimated_clusters,
             "dominant_side": risk["dominant_side"],
             "risk_classification": risk["risk_classification"],
             "squeeze_type": risk["squeeze_type"],
             "nearby_cluster_usd": risk["nearby_cluster_usd"],
+            "nearby_estimated_cluster_usd": round(nearby_estimated_usd),
             "funding_bias": risk["funding_bias"],
             "confidence_score": confidence,
             "venues_used": agg["venues_used"],
@@ -1047,8 +1083,13 @@ async def handle_list_tools() -> list[Tool]:
             name="get_altcoin_liq_clusters",
             description=(
                 "Get real-time liquidation cluster map for an altcoin perp market. "
-                "Returns top clusters (price level, USD volume, side), dominant_side, "
-                "risk_classification, squeeze_type, funding_rate, and confidence_score. "
+                "Returns top_clusters (observed: real order book depth and/or real "
+                "venue liquidation prints only) separately from estimated_clusters "
+                "(synthetic 5x/10x/20x OI-leverage-tier projections) — check each "
+                "cluster's is_synthetic boolean rather than assuming top_clusters is "
+                "all real. Also returns dominant_side, risk_classification, "
+                "squeeze_type, funding_rate, and confidence_score (risk/squeeze are "
+                "derived from observed clusters only). "
                 "BTC and ETH are excluded — altcoins only (SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE, etc)."
             ),
             inputSchema={
@@ -1090,11 +1131,35 @@ async def handle_list_tools() -> list[Tool]:
                     "open_interest_usd": {"type": "number"},
                     "funding_rate": {"type": "number"},
                     "long_short_ratio": {"type": "object"},
-                    "top_clusters": {"type": "array"},
+                    "top_clusters": {
+                        "type": "array",
+                        "description": (
+                            "Observed clusters only — backed by real order book depth "
+                            "and/or a real venue liquidation print. Each item has "
+                            "is_synthetic=false. This drives risk_classification and "
+                            "squeeze_type below."
+                        ),
+                    },
+                    "estimated_clusters": {
+                        "type": "array",
+                        "description": (
+                            "Synthetic clusters from the 5x/10x/20x OI/leverage-tier "
+                            "model only. Each item has is_synthetic=true. A secondary "
+                            "view — never blended into top_clusters ranking or risk "
+                            "scoring."
+                        ),
+                    },
                     "dominant_side": {"type": "string"},
                     "risk_classification": {"type": "string"},
                     "squeeze_type": {"type": "string"},
-                    "nearby_cluster_usd": {"type": "number"},
+                    "nearby_cluster_usd": {
+                        "type": "number",
+                        "description": "USD volume within 5% of mark, observed clusters only.",
+                    },
+                    "nearby_estimated_cluster_usd": {
+                        "type": "number",
+                        "description": "USD volume within 5% of mark, synthetic clusters only.",
+                    },
                     "funding_bias": {"type": "string"},
                     "confidence_score": {"type": "number"},
                     "venues_used": {"type": "array"},
